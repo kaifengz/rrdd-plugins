@@ -20,6 +20,7 @@ open Unixext
 open Threadext
 
 open Rrdp_common
+open Blktap3_stats
 
 module Common = Common(struct let name="xcp-rrdd-iostat" end)
 open Common
@@ -341,16 +342,27 @@ module Stats_value = struct
 			inflight = stats_get 8;
 		}
 
-	let sumup (values : t list) : t =
-		List.fold_left (fun acc v ->
+	let sumup (values : t list) (stats_blktap3, _) : t =
+		let (+) = Int64.add and (-) = Int64.sub and to_float = Int64.to_float in
+		let v = List.fold_left (fun acc v ->
 			{
 				io_throughput_read_mb = acc.io_throughput_read_mb +. v.io_throughput_read_mb;
 				io_throughput_write_mb = acc.io_throughput_write_mb +. v.io_throughput_write_mb;
-				iops_read = Int64.add acc.iops_read v.iops_read;
-				iops_write = Int64.add acc.iops_write v.iops_write;
+				iops_read = acc.iops_read + v.iops_read;
+				iops_write = acc.iops_write + v.iops_write;
 				iowait = acc.iowait +. v.iowait;
-				inflight = Int64.add acc.inflight v.inflight;
+				inflight = acc.inflight + v.inflight;
 			}) empty values
+		in
+		let s3 = stats_blktap3 in
+		{
+			io_throughput_read_mb  = v.io_throughput_read_mb  +. (to_float s3.st_rd_sect) *. 512. /. 1048576.;
+			io_throughput_write_mb = v.io_throughput_write_mb +. (to_float s3.st_wr_sect) *. 512. /. 1048576.;
+			iops_read  = v.iops_read  + s3.st_rd_cnt;
+			iops_write = v.iops_write + s3.st_wr_cnt;
+			iowait = v.iowait +. to_float (s3.st_rd_sum_usecs + s3.st_wr_sum_usecs) /. 1000.0;
+			inflight = v.inflight + (s3.st_rd_req + s3.st_wr_req) - (s3.st_rd_cnt + s3.st_wr_cnt);
+		}
 
 	let make_ds ~owner ~name ~key_format (value : t) =
 		let ds_make = Ds.ds_make ~default:true in
@@ -410,13 +422,18 @@ module Iostats_value = struct
 			avgqu_sz = iostats_get 7;
 		}
 
-	let sumup (values : t list) : t =
+	let sumup (values : t list) (stats_blktap3, nb_vdi) : t =
 		let v = List.fold_left (fun acc v ->
 			{
 				latency = acc.latency +. v.latency;
 				avgqu_sz = acc.avgqu_sz +. v.avgqu_sz;
 		   }) empty values in
-		{ v with avgqu_sz = v.avgqu_sz /. float_of_int (List.length values) }
+		let s3 = stats_blktap3 in
+		let s3_latency_average = Int64.to_float (Int64.add s3.st_rd_sum_usecs s3.st_wr_sum_usecs) /. Int64.to_float (Int64.add s3.st_rd_cnt s3.st_wr_cnt) /. 1000.0 in
+		{
+			latency = (v.latency +. s3_latency_average *. float nb_vdi) /. float_of_int (List.length values + nb_vdi);
+			avgqu_sz = v.avgqu_sz;
+		}
 
 	let make_ds ~owner ~name ~key_format (value : t) =
 		let ds_make = Ds.ds_make ~default:true in
@@ -428,16 +445,156 @@ module Iostats_value = struct
 			ds_make ~name:(key_format "avgqu_sz")
 				~description:"Average I/O queue size"
 				~value:(Rrd.VT_Float value.avgqu_sz)
-                ~ty:Rrd.Gauge ~units:"requests" ~min:0. (), owner;
+				~ty:Rrd.Gauge ~units:"requests" ~min:0. (), owner;
 		]
+end
+
+module Blktap3_stats = struct
+	type t = blktap3_stats
+
+	let empty =
+		{
+		st_ds_req       = 0L;
+		st_f_req        = 0L;
+		st_oo_req       = 0L;
+		st_rd_req       = 0L;
+		st_rd_cnt       = 0L;
+		st_rd_sect      = 0L;
+		st_rd_sum_usecs = 0L;
+		st_rd_max_usecs = 0L;
+		st_wr_req       = 0L;
+		st_wr_cnt       = 0L;
+		st_wr_sect      = 0L;
+		st_wr_sum_usecs = 0L;
+		st_wr_max_usecs = 0L;
+		}
+
+	let get_domid_devid_to_stats_blktap3 () : ((int * int) * t) list =
+		let shm_devices_dir = "/dev/shm" in
+		let read_raw_blktap3_stats vbd =
+			try
+				let stat_file = Printf.sprintf "%s/%s/statistics" shm_devices_dir vbd in
+				(* Retrieve blktap3 statistics record *)
+				let stat_rec = get_blktap3_stats stat_file in
+				Some stat_rec
+			with _ ->
+				None
+		in
+		let shm_dirs = Array.to_list (Sys.readdir shm_devices_dir) in
+		let shm_vbds = List.filter (fun s -> String.startswith "vbd3-" s) shm_dirs in
+		List.fold_left (fun acc vbd ->
+			match read_raw_blktap3_stats vbd with
+			| Some stat ->
+				let domid, devid = Scanf.sscanf vbd "vbd3-%d-%d" (fun id devid -> (id, devid)) in
+				((domid, devid), stat) :: acc
+			| None -> acc
+		) [] shm_vbds
+
+	let get_domid_devid_to_sr_blktap3 (domid_devids : (int * int) list) : ((int * int) * string) list =
+		try
+			with_xs (fun xs ->
+				List.fold_left (fun acc (domid, devid) ->
+					let path = Printf.sprintf "/local/domain/0/backend/vbd3/%d/%d/sm-data/mem-pool" domid devid in
+					let sr = xs.Xs.read path in
+					((domid, devid), sr) :: acc
+				) [] domid_devids
+			)
+		with e ->
+			D.error "Error while looking up the domid-devid to SR map: %s" (Printexc.to_string e);
+			[]
+
+	let get_sr_to_domid_devid_to_stats_blktap3 () : (string, ((int * int) * t) list) Hashtbl.t =
+		let domid_devid_to_stats = get_domid_devid_to_stats_blktap3 () in
+		let domid_devid_to_sr = get_domid_devid_to_sr_blktap3 (List.map (fun (domid_devid, stat) -> domid_devid) domid_devid_to_stats) in
+		let sr_to_domid_devid_to_stats_blktap3 = Hashtbl.create 20 in
+		List.iter (fun (domid_devid, stat) ->
+			if List.mem_assoc domid_devid domid_devid_to_sr then
+				let sr = List.assoc domid_devid domid_devid_to_sr in
+				Hashtbl.add sr_to_domid_devid_to_stats_blktap3 sr ((domid_devid, stat) ::
+					if Hashtbl.mem sr_to_domid_devid_to_stats_blktap3 sr then
+						Hashtbl.find sr_to_domid_devid_to_stats_blktap3 sr
+					else
+						[]
+				)
+		) domid_devid_to_stats;
+		sr_to_domid_devid_to_stats_blktap3
+
+	let consolidate sr_to_domid_devid_to_stats_blktap3 last_sr_to_domid_devid_to_stats_blktap3 : (string, (t * int)) Hashtbl.t =
+		let diff_stats_blktap3 recent last =
+			let diff a b = if a >= b then Int64.sub a b else a in
+			let last = match last with | None -> empty | Some s -> s in
+			{
+				st_ds_req       = diff recent.st_ds_req       last.st_ds_req;
+				st_f_req        = diff recent.st_f_req        last.st_f_req;
+				st_oo_req       = diff recent.st_oo_req       last.st_oo_req;
+				st_rd_req       = diff recent.st_rd_req       last.st_rd_req;
+				st_rd_cnt       = diff recent.st_rd_cnt       last.st_rd_cnt;
+				st_rd_sect      = diff recent.st_rd_sect      last.st_rd_sect;
+				st_rd_sum_usecs = diff recent.st_rd_sum_usecs last.st_rd_sum_usecs;
+				st_rd_max_usecs = recent.st_rd_max_usecs;
+				st_wr_req       = diff recent.st_wr_req       last.st_wr_req;
+				st_wr_cnt       = diff recent.st_wr_cnt       last.st_wr_cnt;
+				st_wr_sect      = diff recent.st_wr_sect      last.st_wr_sect;
+				st_wr_sum_usecs = diff recent.st_wr_sum_usecs last.st_wr_sum_usecs;
+				st_wr_max_usecs = recent.st_wr_max_usecs;
+			}
+		in
+		let sum_up_stats_blktap3 s1 s2 =
+			let max a b = if a >= b then a else b in
+			{
+				st_ds_req       = Int64.add s1.st_ds_req       s2.st_ds_req;
+				st_f_req        = Int64.add s1.st_f_req        s2.st_f_req;
+				st_oo_req       = Int64.add s1.st_oo_req       s2.st_oo_req;
+				st_rd_req       = Int64.add s1.st_rd_req       s2.st_rd_req;
+				st_rd_cnt       = Int64.add s1.st_rd_cnt       s2.st_rd_cnt;
+				st_rd_sect      = Int64.add s1.st_rd_sect      s2.st_rd_sect;
+				st_rd_sum_usecs = Int64.add s1.st_rd_sum_usecs s2.st_rd_sum_usecs;
+				st_rd_max_usecs = max       s1.st_rd_max_usecs s2.st_rd_max_usecs;
+				st_wr_req       = Int64.add s1.st_wr_req       s2.st_wr_req;
+				st_wr_cnt       = Int64.add s1.st_wr_cnt       s2.st_wr_cnt;
+				st_wr_sect      = Int64.add s1.st_wr_sect      s2.st_wr_sect;
+				st_wr_sum_usecs = Int64.add s1.st_wr_sum_usecs s2.st_wr_sum_usecs;
+				st_wr_max_usecs = max       s1.st_wr_max_usecs s2.st_wr_max_usecs;
+			}
+		in
+		let sr_to_stats_blktap3 = Hashtbl.create 20 in
+		Hashtbl.iter (fun sr stats ->
+			let last_stats = match last_sr_to_domid_devid_to_stats_blktap3 with
+				| None -> None
+				| Some stats ->
+						if Hashtbl.mem stats sr then
+							Some (Hashtbl.find stats sr)
+						else
+							None
+			in
+			let sr_stats = List.fold_left (fun acc (domid_devid, recent_s3) ->
+				let last_s3 = match last_stats with
+					| None -> None
+					| Some stats ->
+							if List.mem_assoc domid_devid stats then
+								Some (List.assoc domid_devid stats)
+							else
+								None
+				in
+				let diff = diff_stats_blktap3 recent_s3 last_s3 in
+				sum_up_stats_blktap3 acc diff
+			) empty stats in
+			Hashtbl.add sr_to_stats_blktap3 sr (sr_stats, List.length stats)
+		) sr_to_domid_devid_to_stats_blktap3;
+		sr_to_stats_blktap3
 end
 
 let list_all_assocs key xs = List.map snd (List.filter (fun (k,_) -> k = key) xs)
 
 let sr_vdi_to_last_iostats_values = ref None
 let sr_vdi_to_last_stats_values = ref None
+let last_sr_to_domid_devid_to_stats_blktap3 = ref None
 
 let gen_metrics () =
+	let sr_to_domid_devid_to_stats_blktap3 = Blktap3_stats.get_sr_to_domid_devid_to_stats_blktap3 () in
+    let sr_to_stats_blktap3 = Blktap3_stats.consolidate sr_to_domid_devid_to_stats_blktap3 !last_sr_to_domid_devid_to_stats_blktap3 in
+    last_sr_to_domid_devid_to_stats_blktap3 := Some sr_to_domid_devid_to_stats_blktap3;
+
 	(* Get iostat data first, because this takes 1 second to complete *)
 	let sr_vdi_to_iostats = get_sr_vdi_to_iostats () in
 	let sr_vdi_to_stats   = get_sr_vdi_to_stats   () in
@@ -461,7 +618,23 @@ let gen_metrics () =
 	(* sum up to SR level stats values *)
 	let get_sr_to_stats_values ~stats_values ~sum_fun =
 		let sr_to_stats_values = sr_to_sth stats_values in
-		List.map (fun (sr, stats_values) -> (sr, sum_fun stats_values)) sr_to_stats_values in
+		List.map (fun (sr, stats_values) ->
+			let stats_blktap3_nb_vdi =
+				if Hashtbl.mem sr_to_stats_blktap3 sr then
+					Hashtbl.find sr_to_stats_blktap3 sr
+				else
+					(Blktap3_stats.empty, 0)
+			in
+			(sr, sum_fun stats_values stats_blktap3_nb_vdi)
+		) sr_to_stats_values
+		@
+		Hashtbl.fold (fun sr stats_blktap3_nb_vdi acc ->
+			if List.mem_assoc sr sr_to_stats_values then
+				acc
+			else
+				(sr, sum_fun [] stats_blktap3_nb_vdi) :: acc
+		) sr_to_stats_blktap3 []
+	in
 
 	let sr_to_iostats_values = get_sr_to_stats_values ~stats_values:sr_vdi_to_iostats_values ~sum_fun:Iostats_value.sumup in
 	let sr_to_stats_values   = get_sr_to_stats_values ~stats_values:sr_vdi_to_stats_values   ~sum_fun:Stats_value.sumup   in
